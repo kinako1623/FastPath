@@ -1,0 +1,567 @@
+from system.pyj.minescript import *
+
+# --- Java Classes ---
+Minecraft = JavaClass("net.minecraft.client.Minecraft")
+System = JavaClass("java.lang.System")
+BlockPos = JavaClass("net.minecraft.core.BlockPos")
+PathNavigationRegion = JavaClass("net.minecraft.world.level.PathNavigationRegion")
+WalkNodeEvaluator = JavaClass("net.minecraft.world.level.pathfinder.WalkNodeEvaluator")
+PathFinder = JavaClass("net.minecraft.world.level.pathfinder.PathFinder")
+HashSet = JavaClass("java.util.HashSet")
+EntityType = JavaClass("net.minecraft.world.entity.EntityType")
+EntitySpawnReason = JavaClass("net.minecraft.world.entity.EntitySpawnReason")
+Math = JavaClass("java.lang.Math")
+Attributes = JavaClass("net.minecraft.world.entity.ai.attributes.Attributes")
+PathType = JavaClass("net.minecraft.world.level.pathfinder.PathType")
+HashMap = JavaClass("java.util.HashMap")
+Gizmos = JavaClass("net.minecraft.gizmos.Gizmos")
+GizmoStyle = JavaClass("net.minecraft.gizmos.GizmoStyle")
+Vec3 = JavaClass("net.minecraft.world.phys.Vec3")
+ARGB = JavaClass("net.minecraft.util.ARGB")
+ClipContext = JavaClass("net.minecraft.world.level.ClipContext")
+ClipContextBlock = JavaClass("net.minecraft.world.level.ClipContext$Block")
+ClipContextFluid = JavaClass("net.minecraft.world.level.ClipContext$Fluid")
+HitResultType = JavaClass("net.minecraft.world.phys.HitResult$Type")
+
+# --- Globals & Environment ---
+mc = Minecraft.getInstance()
+level = mc.level
+
+# --- Constants ---
+INF = 9999999.9
+RAD2DEG = 180.0 / Math.PI
+
+# Rendering
+COLOR = ARGB.color(255, 0, 200, 255)
+FILL_COLOR = ARGB.color(60, 0, 200, 255)
+COARSE_COLOR = ARGB.color(255, 255, 150, 255)
+FILLED_STYLE = GizmoStyle.strokeAndFill(COLOR, JavaFloat(1.5), FILL_COLOR)
+COARSE_WIDTH = JavaFloat(2.0)
+LINE_WIDTH = JavaFloat(3.0)
+
+# Pathfinding Settings
+BODY_RADIUS = 0.4
+MAX_VERTICAL_STEP = 3
+MAX_RANGE = 50000.0
+DO_SMOOTH = True
+HEIGHT_OFFSETS = (0.1, 0.6, 1.2, 1.8)
+LOS_BODY_OFFSETS = ((-BODY_RADIUS, -BODY_RADIUS), (-BODY_RADIUS, BODY_RADIUS), (BODY_RADIUS, -BODY_RADIUS), (BODY_RADIUS, BODY_RADIUS), (0.0, 0.0))
+
+# Movement Settings
+MIN_SPEED = 0.01
+MAX_SPEED = 5.0
+PITCH_LIMIT = 50.0
+YAW_COEFF = 0.55
+PITCH_COEFF = 0.20
+ROTATION_MAX_SPEED = 5.0
+PITCH_MAX_SPEED = 1.0
+
+NORMAL_WAYPOINT_THRESHOLD = 0.8
+FINAL_WAYPOINT_THRESHOLD = 0.5
+WAYPOINT_OVERSHOOT_THRESHOLD = 0.5
+
+# --- State Variables ---
+move_status = "idle"
+current_path = None
+coarse_path = None
+current_index = 0
+stuck_ticks = 0
+jump_cooldown = 0
+last_waypoint_dist = INF
+strafe_state = 0
+global_goal = None
+
+
+# --- Movement & Rotation Logic ---
+def normalize_angle(angle):
+    return (angle + 180.0) % 360.0 - 180.0
+
+def move_forward(enable=True):
+    mc.options.keyUp.setDown(enable)
+    mc.options.keySprint.setDown(enable)
+
+def jump(enable=True):
+    mc.options.keyJump.setDown(enable)
+
+def stop_all():
+    global strafe_state, move_status
+    options = mc.options
+    options.keyUp.setDown(False)
+    options.keyJump.setDown(False)
+    options.keyLeft.setDown(False)
+    options.keyRight.setDown(False)
+    strafe_state = 0
+    move_status = "idle"
+
+# --- Pathfinding Caching & Logic ---
+class PathCache:
+    def __init__(self):
+        self.state = HashMap()
+        self.profiles = HashMap()
+        self.chunks = HashMap()
+
+def chamfer(path, amount= 0.5, segments=3): 
+    """
+    曲がり角だけを面取りする。
+
+    ・直線区間はそのまま
+    ・Y座標が変化する角は補完しない
+    ・曲がり角は n 分割する
+    """
+
+    if len(path) < 3:
+        return path[:]
+
+    result = [path[0]]
+
+    for i in range(1, len(path) - 1):
+        a = path[i - 1]
+        b = path[i]
+        c = path[i + 1]
+
+        # 高さが変わる角はそのまま
+        if a[1] != b[1] or b[1] != c[1]:
+            result.append(b)
+            continue
+
+        dx1 = b[0] - a[0]
+        dz1 = b[2] - a[2]
+        dx2 = c[0] - b[0]
+        dz2 = c[2] - b[2]
+
+        len1 = Math.sqrt(dx1 * dx1 + dz1 * dz1)
+        len2 = Math.sqrt(dx2 * dx2 + dz2 * dz2)
+
+        if len1 == 0 or len2 == 0:
+            result.append(b)
+            continue
+
+        ux1 = dx1 / len1
+        uz1 = dz1 / len1
+        ux2 = dx2 / len2
+        uz2 = dz2 / len2
+
+        # 直進ならそのまま
+        if ux1 == ux2 and uz1 == uz2:
+            result.append(b)
+            continue
+
+        d1 = min(amount, len1 * 0.5)
+        d2 = min(amount, len2 * 0.5)
+
+        # 面取り開始点
+        p = (
+            b[0] - ux1 * d1,
+            b[1],
+            b[2] - uz1 * d1,
+        )
+
+        # 面取り終了点
+        q = (
+            b[0] + ux2 * d2,
+            b[1],
+            b[2] + uz2 * d2,
+        )
+
+        # P→Qのみを分割
+        for j in range(segments):
+            t = j / float(segments)
+            result.append((
+                p[0] + (q[0] - p[0]) * t,
+                b[1],
+                p[2] + (q[2] - p[2]) * t,
+            ))
+
+        result.append(q)
+
+    result.append(path[-1])
+
+    return result
+
+def _get_profile_cached(x, y, z, cache):
+    pos_key, chunk_key = (x, y, z), (x // 16, z // 16)
+    
+    if cache.state.get(pos_key) is None:
+        if cache.chunks.get(chunk_key) is None:
+            cache.chunks.put(chunk_key, level.getChunk(chunk_key[0], chunk_key[1]))
+        cache.state.put(pos_key, cache.chunks.get(chunk_key).getBlockState(BlockPos(x, y, z)))
+    
+    state = cache.state.get(pos_key)
+    cached_profile = cache.profiles.get(state)
+    if cached_profile is not None: 
+        return cached_profile
+    
+    if state.isAir(): 
+        profile = (False, 0.0)
+    elif not state.getFluidState().isEmpty(): 
+        profile = (True, 0.0)
+    else:
+        shape = state.getCollisionShape(level, BlockPos(x, y, z))
+        profile = (False, 0.0 if shape.isEmpty() else float(shape.bounds().maxY))
+        
+    cache.profiles.put(state, profile)
+    return profile
+ 
+def _is_supportive_cached(x, y, z, cache):
+    is_liquid, max_y = _get_profile_cached(x, y, z, cache)
+    return (not is_liquid) and max_y > 1e-4
+
+def _blocks_body(x, y, z, cache):
+    is_liquid, max_y = _get_profile_cached(x, y, z, cache)
+    return is_liquid or max_y > 0.5 + 1e-4
+
+def toi(a):
+    return int(Math.floor(a))
+
+def _is_step_pre_node(curr, nxt):
+    return abs(nxt[1] - curr[1]) == 1 and max(abs(nxt[0] - curr[0]), abs(nxt[2] - curr[2])) <= 1
+
+def _same_direction(a, b, c):
+    dx1, dz1 = b[0] - a[0], b[2] - a[2]
+    dx2, dz2 = c[0] - b[0], c[2] - b[2]
+    
+    # 外積がほぼ0（一直線上）かつ、内積がプラス（同じ向き）
+    cross_product = dx1 * dz2 - dz1 * dx2
+    dot_product = dx1 * dx2 + dz1 * dz2
+    
+    return abs(cross_product) < 1e-4 and dot_product > 0
+
+def _dda_cells(sx, sy, sz, ex, ey, ez):
+    x, y, z = toi(sx), toi(sy), toi(sz)
+    end_x, end_y, end_z = toi(ex), toi(ey), toi(ez)
+    
+    dx, dy, dz = ex - sx, ey - sy, ez - sz
+    
+    step_x = 1 if dx > 0 else (-1 if dx < 0 else 0)
+    tx = (x + 1.0 - sx) / dx if dx > 0 else ((sx - x) / -dx if dx < 0 else INF)
+    dtx = 1.0 / abs(dx) if dx != 0 else INF
+
+    step_y = 1 if dy > 0 else (-1 if dy < 0 else 0)
+    ty = (y + 1.0 - sy) / dy if dy > 0 else ((sy - y) / -dy if dy < 0 else INF)
+    dty = 1.0 / abs(dy) if dy != 0 else INF
+
+    step_z = 1 if dz > 0 else (-1 if dz < 0 else 0)
+    tz = (z + 1.0 - sz) / dz if dz > 0 else ((sz - z) / -dz if dz < 0 else INF)
+    dtz = 1.0 / abs(dz) if dz != 0 else INF
+
+    while True:
+        yield x, y, z
+        if x == end_x and y == end_y and z == end_z:
+            break
+        
+        if tx < ty:
+            if tx < tz:
+                x += step_x
+                tx += dtx
+            else:
+                z += step_z
+                tz += dtz
+        else:
+            if ty < tz:
+                y += step_y
+                ty += dty
+            else:
+                z += step_z
+                tz += dtz
+
+def LOS(a, b, cache):
+    start = (a[0] + 0.5, a[1], a[2] + 0.5)
+    end = (b[0] + 0.5, b[1], b[2] + 0.5)
+
+    s_vec_center = Vec3(start[0], start[1] + 1.2, start[2])
+    e_vec_center = Vec3(end[0], end[1] + 1.2, end[2])
+    if level.clip(ClipContext(s_vec_center, e_vec_center, ClipContextBlock.COLLIDER, ClipContextFluid.NONE, mc.player)).getType() != HitResultType.MISS:
+        return False
+
+    end_cell = (toi(end[0]), toi(end[1]), toi(end[2]))
+    drop_relaxed = b[1] < a[1]
+
+    for cx, cy, cz in _dda_cells(start[0], start[1], start[2], end[0], end[1], end[2]):
+        if _blocks_body(cx, cy, cz, cache) or _blocks_body(cx, cy + 1, cz, cache):
+            return False
+        
+        if (not drop_relaxed or (cx, cy, cz) == end_cell) and not _is_supportive_cached(cx, cy - 1, cz, cache):
+            return False
+
+    for ox, oz in LOS_BODY_OFFSETS:
+        if ox == 0.0 and oz == 0.0:
+            continue
+            
+        for oy in HEIGHT_OFFSETS:
+            s_vec = Vec3(start[0] + ox, start[1] + oy, start[2] + oz)
+            e_vec = Vec3(end[0] + ox, end[1] + oy, end[2] + oz)
+            res = level.clip(ClipContext(s_vec, e_vec, ClipContextBlock.COLLIDER, ClipContextFluid.NONE, mc.player)).getType()
+            if res != HitResultType.MISS:
+                return False
+
+    return True
+
+def smooth_path(path, cache):
+    if len(path) <= 2:
+        return path
+
+    exact_path = []
+    for node in path:
+        floor_y = toi(node[1]) - 1
+        is_liquid, max_y = _get_profile_cached(
+            toi(node[0]), floor_y, toi(node[2]), cache
+        )
+        
+        if not is_liquid and 0.0 < max_y < 0.6:
+            exact_path.append((node[0], float(floor_y + max_y), node[2]))
+        else:
+            exact_path.append(node)
+            
+    path = exact_path
+
+    los_path = [path[0]]
+    i = 0
+
+    while i < len(path) - 1:
+        j = i + 1
+        while j < len(path) and LOS(path[i], path[j], cache):
+            j += 1
+
+        pre_jump_idx = max(i + 1, j - 1)
+        target = pre_jump_idx
+
+        if j < len(path) and _is_step_pre_node(path[pre_jump_idx], path[j]):
+            if pre_jump_idx > i:
+                if _same_direction(path[pre_jump_idx - 1], path[pre_jump_idx], path[j]):
+                    target = j
+            else:
+                target = j
+
+        while target + 1 < len(path) and \
+              path[target + 1][1] < path[target][1] and \
+              path[target][1] <= path[i][1] and \
+              _same_direction(path[target - 1], path[target], path[target + 1]):
+            target += 1
+
+        los_path.append(path[target])
+        i = target
+
+        echo(los_path)
+
+    return los_path
+
+# --- Pathfinding Generation ---
+def path_find(start, goal, max_range=MAX_RANGE):
+    t0 = System.currentTimeMillis()
+    pad = int(max_range) + 64
+    region = PathNavigationRegion(level, BlockPos(start[0] - pad, start[1] - 32, start[2] - pad), BlockPos(start[0] + pad, start[1] + 32, start[2] + pad))
+    
+    dummy = EntityType.ZOMBIE.create(level, EntitySpawnReason.LOAD)
+    dummy.setPos(*start)
+    
+    attr = dummy.getAttribute(Attributes.STEP_HEIGHT)
+    if attr: attr.setBaseValue(MAX_VERTICAL_STEP)
+        
+    for p_type in (PathType.WATER, PathType.WATER_BORDER, PathType.LAVA):
+        try: dummy.setPathfindingMalus(p_type, JavaFloat(99.0))
+        except: pass
+    
+    goals = HashSet()
+    goals.add(BlockPos(*goal))
+
+    res = PathFinder(WalkNodeEvaluator(), int(max_range)).findPath(region, dummy, goals, max_range, 0, 1.0)
+    
+    if res and res.getNodeCount() > 1:
+        last = res.getNode(res.getNodeCount() - 1)
+        dist_progress = Math.sqrt((last.x - start[0])**2 + (last.y - start[1])**2 + (last.z - start[2])**2)
+        
+        if dist_progress >= 5.0:
+            echo(f"[Finder] pathfind success: {System.currentTimeMillis() - t0}ms")
+            return [(res.getNode(i).x, res.getNode(i).y, res.getNode(i).z) for i in range(res.getNodeCount())]
+
+    echo("[Finder] pathfind failed")
+    return None
+
+def goto(x, y, z):
+    global current_path, coarse_path, current_index, move_status, stuck_ticks, jump_cooldown, last_waypoint_dist, global_goal
+    
+    move_status = "searching"
+    stop_all()
+    
+    start = (toi(mc.player.getX()), toi(mc.player.getY()), toi(mc.player.getZ()))
+    global_goal = (int(x), int(y), int(z))
+    
+    raw_path = path_find(start, global_goal)
+    if raw_path:
+        coarse_path = raw_path
+        cache = PathCache()
+
+        if DO_SMOOTH:
+            base_path = smooth_path(raw_path, cache)
+            current_path = base_path
+            current_path = chamfer(base_path)
+        else:
+            current_path = raw_path
+        
+        current_index = 0
+        stuck_ticks = 0
+        jump_cooldown = 0
+        last_waypoint_dist = INF
+        move_status = "running"
+        
+        add_event_listener("render", on_render)
+    else:
+        move_status = "failed"
+        
+    return current_path
+
+# --- Render & Tick Event ---
+def _smooth_rotation_speed(delta, is_yaw=True, distance_to_target=None):
+    abs_delta = abs(delta)
+    coeff = YAW_COEFF if is_yaw else PITCH_COEFF
+    base_speed = (4.0 / ((1.0 + Math.exp(-0.18 * (abs_delta - 15.0))) ** 0.8))
+    speed = base_speed * coeff
+
+    if distance_to_target is not None:
+        close_factor = max(0.4, min(1.0, distance_to_target / 3.0))
+        angle_factor = min(abs_delta / 30.0, 1.0)
+        speed *= close_factor + (1.0 - close_factor) * angle_factor
+
+    if is_yaw: 
+        speed = max(MIN_SPEED, min(ROTATION_MAX_SPEED, speed))
+    else: 
+        speed = max(MIN_SPEED, min(PITCH_MAX_SPEED, speed * 0.5))
+
+    return speed if delta >= 0 else -speed
+    
+def update_rotation_and_movement(dist, target_yaw, target_pitch, coasting=False):
+    player = mc.player
+    
+    current_yaw = player.getYRot()
+    yaw_delta = normalize_angle(target_yaw - current_yaw)
+    yaw_speed = _smooth_rotation_speed(yaw_delta, True, dist)
+    new_yaw = (target_yaw if abs(yaw_delta) < 0.08 and dist > 2.0 else current_yaw + yaw_speed)
+    
+    current_pitch = player.getXRot()
+    pitch_delta = target_pitch - current_pitch
+    pitch_speed = _smooth_rotation_speed(pitch_delta, False, dist)
+    new_pitch = max(-PITCH_LIMIT, min(PITCH_LIMIT, (target_pitch if abs(pitch_delta) < 0.08 and dist > 2.0 else current_pitch + pitch_speed)))
+
+    player.setYRot(new_yaw)
+    player.setYHeadRot(new_yaw)
+    player.setXRot(new_pitch)
+
+    yaw_error = abs(normalize_angle(target_yaw - new_yaw))
+    movement_threshold = max(12.0, min(20.0, dist * 2.0))
+    
+    move_forward(not coasting and yaw_error < movement_threshold)
+
+def on_render(e):
+    global current_path, current_index, move_status, stuck_ticks, jump_cooldown, last_waypoint_dist, coarse_path, global_goal
+
+    if move_status in ("idle", "arrived", "failed") or current_path is None:
+        return
+        
+    if move_status == "searching":
+        stop_all()
+        return
+
+    if current_index >= len(current_path):
+        move_status = "arrived"
+        stop_all()
+        echo("[Finder] Arrived at destination.")
+        return
+
+    player = mc.player
+
+    # Render Smoothed Current Path
+    for point in current_path:
+        Gizmos.point(Vec3(point[0], point[1], point[2]), ARGB.color(255, 255, 0, 0), JavaFloat(10))
+        
+    for i in range(len(current_path) - 1):
+        x0, y0, z0 = current_path[i]
+        x1, y1, z1 = current_path[i + 1]
+        Gizmos.line(Vec3(x0 + 0.5, y0 + 0.5, z0 + 0.5), Vec3(x1 + 0.5, y1 + 0.5, z1 + 0.5), COLOR, LINE_WIDTH).setAlwaysOnTop()
+
+    # Movement Logic
+    point = current_path[current_index]
+
+    tx, ty, tz = point[0] + 0.5, point[1], point[2] + 0.5
+    dx = tx - player.getX()
+    dy = ty - current_path[current_index-1][1] if current_index > 0 else ty - player.getY()
+    dz = tz - player.getZ()
+
+    dist_sq = dx * dx + dz * dz
+    dist = Math.sqrt(float(dist_sq))
+    chev_dist = max(abs(dx), abs(dz))
+
+    target_yaw = -(Math.atan2(dx, dz) * RAD2DEG)
+    target_pitch = -(Math.atan2(dy, dist) * RAD2DEG)
+
+    vel = player.getDeltaMovement()
+    speed = Math.sqrt(float(vel.x * vel.x + vel.y * vel.y + vel.z * vel.z))
+    speed2D = Math.sqrt(float(vel.x * vel.x + vel.z * vel.z))
+    
+    is_last_of_segment = (current_index >= len(current_path) - 1)
+    is_final_waypoint = is_last_of_segment and (global_goal is not None and current_path[-1] == global_goal)
+    
+    is_step_up = dy > 0.6
+    jump_cooldown = max(0, jump_cooldown - 1)
+    is_sharp_turn = False
+
+    if not is_last_of_segment and (current_index + 1 < len(current_path)):
+        next_point = current_path[current_index + 1]
+        nx, nz = next_point[0] + 0.5, next_point[2] + 0.5
+        next_path_yaw = -(Math.atan2(nx - tx, nz - tz) * RAD2DEG)
+        turn_limit = 70 + speed * 20
+
+        if abs(normalize_angle(next_path_yaw - target_yaw)) > turn_limit:
+            is_sharp_turn = True
+
+        player_to_next_sq = (nx - player.getX())**2 + (nz - player.getZ())**2
+        current_to_next_sq = (nx - tx)**2 + (nz - tz)**2
+
+        if player_to_next_sq < current_to_next_sq and not is_sharp_turn and not is_step_up:
+            last_waypoint_dist = INF
+            current_index += 1
+            return
+
+    waypoint_threshold = FINAL_WAYPOINT_THRESHOLD if is_final_waypoint else NORMAL_WAYPOINT_THRESHOLD
+
+    if not is_final_waypoint:
+        if not player.onGround():
+            waypoint_threshold = max(waypoint_threshold, 1.4)
+        elif is_sharp_turn:
+            waypoint_threshold = 0.4
+
+    if chev_dist < waypoint_threshold:
+        last_waypoint_dist = INF
+        current_index += 1
+        return
+
+    if not is_final_waypoint and chev_dist > last_waypoint_dist + WAYPOINT_OVERSHOOT_THRESHOLD:
+        current_index += 1
+        last_waypoint_dist = INF
+        return
+
+    dynamic_jump_dist = 1.5 + (speed2D * 2)
+    should_normal_jump = (dy > 0.8 and chev_dist < dynamic_jump_dist) or (dy > 1.2 and chev_dist < dynamic_jump_dist + 0.8)
+
+    if should_normal_jump and is_step_up and player.onGround():
+        jump(True)
+        jump_cooldown = 2
+    else:
+        jump(False)
+
+    last_waypoint_dist = chev_dist
+    coasting = False
+
+    # if (jump_cooldown > 0 or not player.onGround()) and not is_final_waypoint:
+    #     if speed > 0.15 and pred_dist < 0.3:
+    #         coasting = True
+
+    update_rotation_and_movement(dist, target_yaw, target_pitch, coasting=coasting)
+
+    if speed != 0 and speed < 0.1:
+        stuck_ticks += 1
+    else:
+        stuck_ticks = 0
+
+    if stuck_ticks > 20:
+        jump(True)
+        jump_cooldown = 1

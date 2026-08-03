@@ -41,7 +41,7 @@ COARSE_WIDTH = JavaFloat(2.0)
 LINE_WIDTH = JavaFloat(3.0)
 
 # Pathfinding Settings
-BODY_RADIUS = 0.4
+BODY_RADIUS = 0.3
 MAX_VERTICAL_STEP = 3
 MAX_RANGE = 50000.0
 DO_SMOOTH = True
@@ -57,8 +57,8 @@ PITCH_COEFF = 0.20
 ROTATION_MAX_SPEED = 5.0
 PITCH_MAX_SPEED = 1.0
 
-NORMAL_WAYPOINT_THRESHOLD = 0.6
-FINAL_WAYPOINT_THRESHOLD = 0.5
+NORMAL_WAYPOINT_THRESHOLD = 0.5
+FINAL_WAYPOINT_THRESHOLD = 0.2
 WAYPOINT_OVERSHOOT_THRESHOLD = 0.5
 
 # --- State Variables ---
@@ -109,7 +109,7 @@ def _curve_is_safe(points, cache):
             return False
     return True
 
-def fillet(path, amount=1.4, segments=6, body_radius=BODY_RADIUS - 0.1, cache=None):
+def fillet(path, amount=3, segments=6, body_radius=BODY_RADIUS - 0.1, cache=None):
     if len(path) < 3:
         return path[:]
 
@@ -153,12 +153,12 @@ def fillet(path, amount=1.4, segments=6, body_radius=BODY_RADIUS - 0.1, cache=No
             result.append(b)
             continue
 
-        angle_factor = max(0.0, 1.0 - turn / Math.PI)
-        cut = amount * angle_factor
-
+        cut = amount
         max_cut = min(len1 * 0.45, len2 * 0.45)
-        d1 = min(cut, max_cut)
-        d2 = min(cut, max_cut)
+        cut = min(cut, max_cut)
+
+        d1 = cut
+        d2 = cut
 
         p = (
             b[0] - ux1 * d1,
@@ -374,8 +374,8 @@ def path_find(start, goal, max_range=MAX_RANGE):
     attr = dummy.getAttribute(Attributes.STEP_HEIGHT)
     if attr: attr.setBaseValue(MAX_VERTICAL_STEP)
         
-    for p_type in (PathType.WATER, PathType.WATER_BORDER, PathType.LAVA):
-        try: dummy.setPathfindingMalus(p_type, JavaFloat(99.0))
+    for p_type in (PathType.WATER, PathType.LAVA):
+        try: dummy.setPathfindingMalus(p_type, JavaFloat(999.0))
         except: pass
     
     goals = HashSet()
@@ -566,7 +566,7 @@ def on_render(e):
             last_waypoint_dist = INF
             return
 
-    dynamic_jump_dist = 2 + (speed2D * 5)
+    dynamic_jump_dist = 2.3 + (speed2D * 5)
     
     should_normal_jump = (actual_dy > 0.8 and chev_dist < dynamic_jump_dist) or (actual_dy > 1.2 and chev_dist < dynamic_jump_dist + 0.8)
 
@@ -586,6 +586,6 @@ def on_render(e):
     else:
         stuck_ticks = 0
 
-    if stuck_ticks > 20:
+    if stuck_ticks > 10:
         jump(True)
-        jump_cooldown = 1 
+        jump_cooldown = 1  
